@@ -1,0 +1,26 @@
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Build outputs
+/bin/
+/dist/
+*.exe
+*.test
+*.out
+
+# Test and coverage artifacts
+coverage.out
+coverage.html
+
+# Logs and local runtime data
+*.log
+/tmp/
+
+# Editor and operating-system files
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
