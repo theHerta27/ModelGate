@@ -2,15 +2,39 @@
 
 > High-performance LLM & Agent Gateway written in Go.
 
-ModelGate is a learning-driven backend engineering project for building the infrastructure behind LLM and agent applications. The project will evolve incrementally, with each capability introduced only when it solves a concrete gateway problem.
+ModelGate is a learning-driven backend engineering project for building the infrastructure behind LLM and agent applications. It evolves incrementally, with each capability introduced only when it solves a concrete gateway problem.
 
 ## Current Status
 
-**Version 0 — Go foundations and repository setup**
+**Version 1 — minimal gateway complete**
 
-The repository is currently being initialized. No gateway API or production feature is implemented yet.
+V1 provides a non-streaming OpenAI-compatible subset backed by a deterministic Mock Provider by default. DeepSeek and generic OpenAI-compatible upstreams can be selected explicitly through environment variables.
 
-## Planned Technology Stack
+## Features
+
+- `GET /health`
+- `POST /v1/chat/completions`
+- Provider interface with Mock, DeepSeek, and generic OpenAI-compatible adapters
+- Request validation and OpenAI-style error envelopes
+- Request-context propagation and bounded upstream HTTP clients
+- Graceful HTTP server shutdown
+- Unit tests that do not require real LLM credentials
+
+Not implemented yet: SSE streaming, authentication, rate limiting, caching, persistence, retries, circuit breaking, or provider routing.
+
+## Architecture
+
+```text
+Client
+  -> Gin Handler       HTTP parsing and response mapping
+  -> Chat Service      deterministic request validation
+  -> Provider          vendor-independent interface
+       |-- MockProvider (default)
+       |-- DeepSeekProvider
+       `-- OpenAICompatibleProvider
+```
+
+## Technology Stack
 
 - Go and Gin
 - PostgreSQL with pgx and SQL migrations
@@ -19,12 +43,92 @@ The repository is currently being initialized. No gateway API or production feat
 - Docker and Docker Compose
 - GitHub Actions
 
-Technologies may be adjusted as the implementation evolves. Kafka, Kubernetes, service mesh, and premature microservice decomposition are intentionally out of scope for the initial versions.
+Gin is the only direct runtime dependency in V1. PostgreSQL, Redis, Prometheus, Grafana, and Docker are planned for later versions when their corresponding capabilities are implemented.
+
+## Quick Start
+
+Requirements: Go 1.26.4 or later.
+
+```bash
+go run ./cmd/server
+```
+
+The default configuration starts ModelGate on `:8080` with the Mock Provider, so no API key is needed.
+
+```bash
+curl http://localhost:8080/health
+
+curl http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "mock-model",
+    "messages": [{"role": "user", "content": "Hello, ModelGate"}]
+  }'
+```
+
+## Configuration
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `HTTP_ADDR` | `:8080` | Gateway listen address |
+| `MODEL_PROVIDER` | `mock` | `mock`, `deepseek`, or `openai-compatible` |
+| `REQUEST_TIMEOUT` | `30s` | Upstream HTTP client timeout |
+| `DEEPSEEK_BASE_URL` | `https://api.deepseek.com` | DeepSeek API base URL |
+| `DEEPSEEK_API_KEY` | empty | Required only for DeepSeek |
+| `OPENAI_COMPATIBLE_BASE_URL` | `https://api.openai.com/v1` | Generic compatible API base URL |
+| `OPENAI_API_KEY` | empty | Required only for the generic compatible provider |
+
+Copy `.env.example` to `.env` for local reference, but export the variables through your shell or runtime. ModelGate does not load `.env` files automatically in V1.
+
+## API
+
+### Health
+
+```http
+GET /health
+```
+
+```json
+{"status":"ok"}
+```
+
+### Chat Completions
+
+```http
+POST /v1/chat/completions
+Content-Type: application/json
+```
+
+```json
+{
+  "model": "mock-model",
+  "messages": [
+    {"role": "system", "content": "Be concise."},
+    {"role": "user", "content": "Hello"}
+  ],
+  "temperature": 0.7,
+  "max_tokens": 256,
+  "stream": false
+}
+```
+
+V1 accepts text messages with `developer`, `system`, `user`, or `assistant` roles. It also supports the optional `temperature`, `top_p`, and `max_tokens` fields. `stream: true` returns a clear validation error until V1.5.
+
+## Testing
+
+```bash
+go test ./...
+go test -race ./...
+go vet ./...
+go build ./cmd/server
+```
+
+Tests use Mock Provider or local `httptest` upstreams and never require a real LLM key.
 
 ## Roadmap
 
-- [ ] **V0 (in progress):** Repository initialization and Go foundations
-- [ ] **V1:** Minimal OpenAI-compatible gateway, provider abstraction, mock provider, and non-streaming chat completions
+- [x] **V0:** Repository initialization and Go foundations
+- [x] **V1:** Minimal OpenAI-compatible gateway, provider abstraction, mock provider, and non-streaming chat completions
 - [ ] **V1.5:** SSE streaming, cancellation, and resource cleanup
 - [ ] **V2:** Redis rate limiting, idempotency, response-cache policy, and PostgreSQL usage persistence
 - [ ] **V3:** Timeouts, retries, circuit breaker, provider routing, concurrency control, and observability
