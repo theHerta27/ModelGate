@@ -32,7 +32,23 @@ func (s *ChatService) Chat(
 	if err := validateChatRequest(req); err != nil {
 		return nil, err
 	}
+	if req.Stream {
+		return nil, invalid("invalid_stream_mode", "streaming requests must use ChatStream")
+	}
 	return s.provider.Chat(ctx, req)
+}
+
+func (s *ChatService) ChatStream(
+	ctx context.Context,
+	req *provider.ChatRequest,
+) (provider.Stream, error) {
+	if err := validateChatRequest(req); err != nil {
+		return nil, err
+	}
+	if !req.Stream {
+		return nil, invalid("invalid_stream_mode", "stream must be true for ChatStream")
+	}
+	return s.provider.ChatStream(ctx, req)
 }
 
 func validateChatRequest(req *provider.ChatRequest) error {
@@ -76,10 +92,6 @@ func validateChatRequest(req *provider.ChatRequest) error {
 	if req.MaxTokens != nil && *req.MaxTokens <= 0 {
 		return invalid("invalid_max_tokens", "max_tokens must be greater than zero")
 	}
-	if req.Stream {
-		return invalid("streaming_not_supported", "streaming is planned for V1.5")
-	}
-
 	return nil
 }
 

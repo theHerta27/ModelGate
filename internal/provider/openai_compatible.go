@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
 	"net/url"
 	"strings"
@@ -56,21 +57,9 @@ func NewOpenAICompatibleProvider(
 }
 
 func (p *OpenAICompatibleProvider) Chat(ctx context.Context, req *ChatRequest) (*ChatResponse, error) {
-	body, err := json.Marshal(req)
+	resp, err := p.doRequest(ctx, req, "application/json")
 	if err != nil {
-		return nil, fmt.Errorf("encode %s request: %w", p.name, err)
-	}
-
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, p.endpoint, bytes.NewReader(body))
-	if err != nil {
-		return nil, fmt.Errorf("create %s request: %w", p.name, err)
-	}
-	httpReq.Header.Set("Authorization", "Bearer "+p.apiKey)
-	httpReq.Header.Set("Content-Type", "application/json")
-
-	resp, err := p.client.Do(httpReq)
-	if err != nil {
-		return nil, fmt.Errorf("call %s provider: %w", p.name, err)
+		return nil, err
 	}
 	defer resp.Body.Close()
 
@@ -80,9 +69,6 @@ func (p *OpenAICompatibleProvider) Chat(ctx context.Context, req *ChatRequest) (
 	}
 	if len(responseBody) > maxUpstreamResponseBytes {
 		return nil, fmt.Errorf("%s response exceeds %d bytes", p.name, maxUpstreamResponseBytes)
-	}
-	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		return nil, fmt.Errorf("%s provider returned HTTP %d", p.name, resp.StatusCode)
 	}
 
 	var chatResponse ChatResponse
@@ -96,6 +82,52 @@ func (p *OpenAICompatibleProvider) Chat(ctx context.Context, req *ChatRequest) (
 	return &chatResponse, nil
 }
 
-func (p *OpenAICompatibleProvider) ChatStream(context.Context, *ChatRequest) (Stream, error) {
-	return nil, ErrStreamingNotSupported
+func (p *OpenAICompatibleProvider) ChatStream(
+	ctx context.Context,
+	req *ChatRequest,
+) (Stream, error) {
+	streamRequest := *req
+	streamRequest.Stream = true
+
+	resp, err := p.doRequest(ctx, &streamRequest, "text/event-stream")
+	if err != nil {
+		return nil, err
+	}
+
+	mediaType, _, err := mime.ParseMediaType(resp.Header.Get("Content-Type"))
+	if err != nil || mediaType != "text/event-stream" {
+		_ = resp.Body.Close()
+		return nil, fmt.Errorf("%s provider returned a non-SSE response", p.name)
+	}
+
+	return newSSEStream(ctx, resp.Body), nil
+}
+
+func (p *OpenAICompatibleProvider) doRequest(
+	ctx context.Context,
+	req *ChatRequest,
+	accept string,
+) (*http.Response, error) {
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("encode %s request: %w", p.name, err)
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, p.endpoint, bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("create %s request: %w", p.name, err)
+	}
+	httpReq.Header.Set("Authorization", "Bearer "+p.apiKey)
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Accept", accept)
+
+	resp, err := p.client.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("call %s provider: %w", p.name, err)
+	}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		_ = resp.Body.Close()
+		return nil, fmt.Errorf("%s provider returned HTTP %d", p.name, resp.StatusCode)
+	}
+	return resp, nil
 }

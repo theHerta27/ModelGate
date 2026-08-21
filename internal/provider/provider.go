@@ -2,10 +2,7 @@ package provider
 
 import (
 	"context"
-	"errors"
 )
-
-var ErrStreamingNotSupported = errors.New("streaming is not supported in V1")
 
 // Provider is the boundary between ModelGate's deterministic gateway logic
 // and a model vendor's transport implementation.
@@ -14,8 +11,9 @@ type Provider interface {
 	ChatStream(ctx context.Context, req *ChatRequest) (Stream, error)
 }
 
-// Stream is defined in V1 so providers share one stable contract. V1 rejects
-// streaming requests; concrete stream implementations arrive in V1.5.
+// Stream owns the upstream response body until Close is called. Callers must
+// close every successfully created stream on all exit paths and use a single
+// Recv consumer.
 type Stream interface {
 	Recv() (*ChatStreamChunk, error)
 	Close() error
@@ -62,10 +60,16 @@ type ChatStreamChunk struct {
 	Created int64              `json:"created"`
 	Model   string             `json:"model"`
 	Choices []ChatStreamChoice `json:"choices"`
+	Usage   *ChatUsage         `json:"usage,omitempty"`
 }
 
 type ChatStreamChoice struct {
-	Index        int         `json:"index"`
-	Delta        ChatMessage `json:"delta"`
-	FinishReason *string     `json:"finish_reason"`
+	Index        int       `json:"index"`
+	Delta        ChatDelta `json:"delta"`
+	FinishReason *string   `json:"finish_reason"`
+}
+
+type ChatDelta struct {
+	Role    string `json:"role,omitempty"`
+	Content string `json:"content,omitempty"`
 }
