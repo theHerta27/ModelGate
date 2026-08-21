@@ -6,9 +6,9 @@ ModelGate is a learning-driven backend engineering project for building the infr
 
 ## Current Status
 
-**Version 1 — minimal gateway complete**
+**Version 1.5 — SSE streaming complete**
 
-V1 provides a non-streaming OpenAI-compatible subset backed by a deterministic Mock Provider by default. DeepSeek and generic OpenAI-compatible upstreams can be selected explicitly through environment variables.
+V1.5 provides streaming and non-streaming OpenAI-compatible chat completions. It uses a deterministic Mock Provider by default; DeepSeek and generic OpenAI-compatible upstreams can be selected explicitly through environment variables.
 
 ## Features
 
@@ -16,11 +16,13 @@ V1 provides a non-streaming OpenAI-compatible subset backed by a deterministic M
 - `POST /v1/chat/completions`
 - Provider interface with Mock, DeepSeek, and generic OpenAI-compatible adapters
 - Request validation and OpenAI-style error envelopes
+- Incremental SSE forwarding with `data: <JSON>` events and a final `data: [DONE]`
+- Client-cancellation propagation, per-chunk flushing, and deterministic stream cleanup
 - Request-context propagation and bounded upstream HTTP clients
 - Graceful HTTP server shutdown
 - Unit tests that do not require real LLM credentials
 
-Not implemented yet: SSE streaming, authentication, rate limiting, caching, persistence, retries, circuit breaking, or provider routing.
+Not implemented yet: authentication, rate limiting, caching, persistence, retries, circuit breaking, or provider routing.
 
 ## Architecture
 
@@ -29,6 +31,7 @@ Client
   -> Gin Handler       HTTP parsing and response mapping
   -> Chat Service      deterministic request validation
   -> Provider          vendor-independent interface
+       |-- Stream      typed chunk receive and lifecycle contract
        |-- MockProvider (default)
        |-- DeepSeekProvider
        `-- OpenAICompatibleProvider
@@ -63,6 +66,14 @@ curl http://localhost:8080/v1/chat/completions \
   -d '{
     "model": "mock-model",
     "messages": [{"role": "user", "content": "Hello, ModelGate"}]
+  }'
+
+curl -N http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "mock-model",
+    "messages": [{"role": "user", "content": "Stream this response"}],
+    "stream": true
   }'
 ```
 
@@ -112,7 +123,15 @@ Content-Type: application/json
 }
 ```
 
-V1 accepts text messages with `developer`, `system`, `user`, or `assistant` roles. It also supports the optional `temperature`, `top_p`, and `max_tokens` fields. `stream: true` returns a clear validation error until V1.5.
+ModelGate accepts text messages with `developer`, `system`, `user`, or `assistant` roles. It also supports the optional `temperature`, `top_p`, and `max_tokens` fields.
+
+Set `stream` to `true` to receive `Content-Type: text/event-stream`. Each incremental chunk is emitted as `data: <JSON>` followed by a blank line. A successful stream ends with:
+
+```text
+data: [DONE]
+```
+
+If a provider fails before the first chunk, ModelGate returns its normal JSON error envelope. If it fails after streaming has started, ModelGate closes the response because the HTTP status has already been committed.
 
 ## Testing
 
@@ -123,13 +142,13 @@ go vet ./...
 go build ./cmd/server
 ```
 
-Tests use Mock Provider or local `httptest` upstreams and never require a real LLM key.
+Tests use Mock Provider or local `httptest` upstreams and never require a real LLM key. The streaming tests cover SSE parsing, `[DONE]`, keep-alive comments, oversized events, cancellation propagation, flushing, error boundaries, and response-body cleanup.
 
 ## Roadmap
 
 - [x] **V0:** Repository initialization and Go foundations
 - [x] **V1:** Minimal OpenAI-compatible gateway, provider abstraction, mock provider, and non-streaming chat completions
-- [ ] **V1.5:** SSE streaming, cancellation, and resource cleanup
+- [x] **V1.5:** SSE streaming, cancellation, and resource cleanup
 - [ ] **V2:** Redis rate limiting, idempotency, response-cache policy, and PostgreSQL usage persistence
 - [ ] **V3:** Timeouts, retries, circuit breaker, provider routing, concurrency control, and observability
 - [ ] **V4:** Docker Compose environment, integration tests, benchmarks, and CI
