@@ -28,9 +28,23 @@ type GatewayOptions struct {
 	CachePolicy       cache.Policy
 	Recorder          storage.Recorder
 	ProviderName      string
+	RequestTimeout    time.Duration
 	OperationTimeout  time.Duration
 	ErrorSink         func(error)
+	Observer          GatewayObserver
 }
+
+type GatewayObserver interface {
+	ObserveRateLimited()
+	ObserveCacheHit()
+	ObserveTokens(string, provider.ChatUsage)
+}
+
+type noopGatewayObserver struct{}
+
+func (noopGatewayObserver) ObserveRateLimited()                      {}
+func (noopGatewayObserver) ObserveCacheHit()                         {}
+func (noopGatewayObserver) ObserveTokens(string, provider.ChatUsage) {}
 
 type GatewayService struct {
 	chat              *ChatService
@@ -41,18 +55,22 @@ type GatewayService struct {
 	cachePolicy       cache.Policy
 	recorder          storage.Recorder
 	providerName      string
+	requestTimeout    time.Duration
 	operationTimeout  time.Duration
 	errorSink         func(error)
+	observer          GatewayObserver
 }
 
 type RequestMetadata struct {
 	ClientIdentity string
 	IdempotencyKey string
+	RequestID      string
 }
 
 type ChatResult struct {
 	Response            *provider.ChatResponse
 	RequestID           string
+	Provider            string
 	CacheStatus         string
 	IdempotencyReplayed bool
 	RateLimit           ratelimit.Decision
@@ -61,6 +79,7 @@ type ChatResult struct {
 type StreamResult struct {
 	Stream    provider.Stream
 	RequestID string
+	Provider  string
 	RateLimit ratelimit.Decision
 }
 
@@ -71,8 +90,14 @@ func NewGatewayService(chat *ChatService, options GatewayOptions) *GatewayServic
 	if options.OperationTimeout <= 0 {
 		options.OperationTimeout = 2 * time.Second
 	}
+	if options.RequestTimeout <= 0 {
+		options.RequestTimeout = 30 * time.Second
+	}
 	if options.ErrorSink == nil {
 		options.ErrorSink = func(error) {}
+	}
+	if options.Observer == nil {
+		options.Observer = noopGatewayObserver{}
 	}
 	return &GatewayService{
 		chat:              chat,
@@ -83,8 +108,10 @@ func NewGatewayService(chat *ChatService, options GatewayOptions) *GatewayServic
 		cachePolicy:       options.CachePolicy,
 		recorder:          options.Recorder,
 		providerName:      options.ProviderName,
+		requestTimeout:    options.RequestTimeout,
 		operationTimeout:  options.OperationTimeout,
 		errorSink:         options.ErrorSink,
+		observer:          options.Observer,
 	}
 }
 
@@ -93,6 +120,9 @@ func (g *GatewayService) Chat(
 	req *provider.ChatRequest,
 	metadata RequestMetadata,
 ) (*ChatResult, error) {
+	ctx, cancel := context.WithTimeout(ctx, g.requestTimeout)
+	defer cancel()
+
 	if err := ValidateChatRequest(req); err != nil {
 		return nil, err
 	}
@@ -104,9 +134,13 @@ func (g *GatewayService) Chat(
 		return nil, err
 	}
 
-	requestID, err := newRequestID()
-	if err != nil {
-		return nil, &DependencyError{Code: "request_id_unavailable", Cause: err}
+	requestID := strings.TrimSpace(metadata.RequestID)
+	if requestID == "" {
+		generatedRequestID, err := NewRequestID()
+		if err != nil {
+			return nil, &DependencyError{Code: "request_id_unavailable", Cause: err}
+		}
+		requestID = generatedRequestID
 	}
 	startedAt := time.Now()
 	rateDecision, err := g.enforceRateLimit(ctx, metadata.ClientIdentity)
@@ -152,13 +186,13 @@ func (g *GatewayService) Chat(
 				return nil, &DependencyError{Code: "idempotency_result_corrupt", Cause: err}
 			}
 			g.record(ctx, storage.RequestRecord{
-				RequestID: requestID, Provider: g.providerName, Model: req.Model,
+				RequestID: requestID, Provider: "idempotency", Model: req.Model,
 				Status: storage.StatusIdempotencyReplay, Latency: time.Since(startedAt),
 				CacheStatus: cache.StatusBypass,
 			})
 			return &ChatResult{
 				Response: &replay, RequestID: requestID, CacheStatus: cache.StatusBypass,
-				IdempotencyReplayed: true, RateLimit: rateDecision,
+				Provider: "idempotency", IdempotencyReplayed: true, RateLimit: rateDecision,
 			}, nil
 		}
 	}
@@ -180,15 +214,16 @@ func (g *GatewayService) Chat(
 				g.errorSink(fmt.Errorf("decode cached response: %w", err))
 			} else {
 				cacheStatus = cache.StatusHit
+				g.observer.ObserveCacheHit()
 				g.completeIdempotency(scopedIdempotencyKey, fingerprint, payload, acquiredIdempotency)
 				g.record(ctx, storage.RequestRecord{
-					RequestID: requestID, Provider: g.providerName, Model: req.Model,
+					RequestID: requestID, Provider: "cache", Model: req.Model,
 					Status: storage.StatusCacheHit, Latency: time.Since(startedAt),
 					CacheStatus: cacheStatus,
 				})
 				return &ChatResult{
 					Response: &cached, RequestID: requestID, CacheStatus: cacheStatus,
-					RateLimit: rateDecision,
+					Provider: "cache", RateLimit: rateDecision,
 				}, nil
 			}
 		}
@@ -196,13 +231,18 @@ func (g *GatewayService) Chat(
 
 	response, err := g.chat.Chat(ctx, req)
 	if err != nil {
+		selectedProvider := providerNameFromError(err, g.providerName)
 		g.releaseIdempotency(scopedIdempotencyKey, fingerprint, acquiredIdempotency)
 		g.record(ctx, storage.RequestRecord{
-			RequestID: requestID, Provider: g.providerName, Model: req.Model,
+			RequestID: requestID, Provider: selectedProvider, Model: req.Model,
 			Status: storage.StatusFailed, Latency: time.Since(startedAt),
 			CacheStatus: cacheStatus, ErrorCode: gatewayErrorCode(err),
 		})
 		return nil, err
+	}
+	selectedProvider := response.Provider
+	if selectedProvider == "" {
+		selectedProvider = g.providerName
 	}
 
 	payload, marshalErr := json.Marshal(response)
@@ -220,14 +260,15 @@ func (g *GatewayService) Chat(
 	}
 
 	g.record(ctx, storage.RequestRecord{
-		RequestID: requestID, Provider: g.providerName, Model: req.Model,
+		RequestID: requestID, Provider: selectedProvider, Model: req.Model,
 		Status: storage.StatusSucceeded, Latency: time.Since(startedAt),
 		InputTokens: response.Usage.PromptTokens, OutputTokens: response.Usage.CompletionTokens,
 		TotalTokens: response.Usage.TotalTokens, CacheStatus: cacheStatus,
 	})
+	g.observer.ObserveTokens(selectedProvider, response.Usage)
 	return &ChatResult{
 		Response: response, RequestID: requestID, CacheStatus: cacheStatus,
-		RateLimit: rateDecision,
+		Provider: selectedProvider, RateLimit: rateDecision,
 	}, nil
 }
 
@@ -236,55 +277,76 @@ func (g *GatewayService) ChatStream(
 	req *provider.ChatRequest,
 	metadata RequestMetadata,
 ) (*StreamResult, error) {
+	streamCtx, cancel := context.WithTimeout(ctx, g.requestTimeout)
+
 	if err := ValidateChatRequest(req); err != nil {
+		cancel()
 		return nil, err
 	}
 	if !req.Stream {
+		cancel()
 		return nil, invalid("invalid_stream_mode", "stream must be true for ChatStream")
 	}
 	if strings.TrimSpace(metadata.IdempotencyKey) != "" {
+		cancel()
 		return nil, invalid(
 			"idempotency_not_supported_for_stream",
 			"Idempotency-Key is only supported for non-streaming requests",
 		)
 	}
-	requestID, err := newRequestID()
-	if err != nil {
-		return nil, &DependencyError{Code: "request_id_unavailable", Cause: err}
+	requestID := strings.TrimSpace(metadata.RequestID)
+	if requestID == "" {
+		generatedRequestID, err := NewRequestID()
+		if err != nil {
+			cancel()
+			return nil, &DependencyError{Code: "request_id_unavailable", Cause: err}
+		}
+		requestID = generatedRequestID
 	}
 	startedAt := time.Now()
-	rateDecision, err := g.enforceRateLimit(ctx, metadata.ClientIdentity)
+	rateDecision, err := g.enforceRateLimit(streamCtx, metadata.ClientIdentity)
 	if err != nil {
-		g.record(ctx, storage.RequestRecord{
+		g.record(streamCtx, storage.RequestRecord{
 			RequestID: requestID, Provider: g.providerName, Model: req.Model,
 			Status: statusForGatewayError(err), Latency: time.Since(startedAt),
 			CacheStatus: cache.StatusBypass, ErrorCode: gatewayErrorCode(err),
 		})
+		cancel()
 		return nil, err
 	}
-	stream, err := g.chat.ChatStream(ctx, req)
+	stream, err := g.chat.ChatStream(streamCtx, req)
 	if err != nil {
-		g.record(ctx, storage.RequestRecord{
-			RequestID: requestID, Provider: g.providerName, Model: req.Model,
+		selectedProvider := providerNameFromError(err, g.providerName)
+		g.record(streamCtx, storage.RequestRecord{
+			RequestID: requestID, Provider: selectedProvider, Model: req.Model,
 			Status: storage.StatusFailed, Latency: time.Since(startedAt),
 			CacheStatus: cache.StatusBypass, ErrorCode: gatewayErrorCode(err),
 		})
+		cancel()
 		return nil, err
+	}
+	selectedProvider := provider.StreamProviderName(stream)
+	if selectedProvider == "unknown" {
+		selectedProvider = g.providerName
 	}
 
 	metered := &meteredStream{
-		inner: stream,
+		inner:  stream,
+		cancel: cancel,
 		finish: func(status, errorCode string, usage provider.ChatUsage) {
 			g.record(ctx, storage.RequestRecord{
-				RequestID: requestID, Provider: g.providerName, Model: req.Model,
+				RequestID: requestID, Provider: selectedProvider, Model: req.Model,
 				Status: status, Latency: time.Since(startedAt),
 				InputTokens: usage.PromptTokens, OutputTokens: usage.CompletionTokens,
 				TotalTokens: usage.TotalTokens, CacheStatus: cache.StatusBypass,
 				ErrorCode: errorCode,
 			})
+			g.observer.ObserveTokens(selectedProvider, usage)
 		},
 	}
-	return &StreamResult{Stream: metered, RequestID: requestID, RateLimit: rateDecision}, nil
+	return &StreamResult{
+		Stream: metered, RequestID: requestID, Provider: selectedProvider, RateLimit: rateDecision,
+	}, nil
 }
 
 func (g *GatewayService) enforceRateLimit(
@@ -303,6 +365,7 @@ func (g *GatewayService) enforceRateLimit(
 		return ratelimit.Decision{}, &DependencyError{Code: "rate_limiter_unavailable", Cause: err}
 	}
 	if !decision.Allowed {
+		g.observer.ObserveRateLimited()
 		return decision, &RateLimitError{Decision: decision}
 	}
 	return decision, nil
@@ -389,7 +452,7 @@ func requestFingerprint(req *provider.ChatRequest) (string, error) {
 	return hex.EncodeToString(digest[:]), nil
 }
 
-func newRequestID() (string, error) {
+func NewRequestID() (string, error) {
 	value := make([]byte, 16)
 	if _, err := rand.Read(value); err != nil {
 		return "", fmt.Errorf("generate request id: %w", err)
@@ -460,6 +523,10 @@ func gatewayErrorCode(err error) string {
 	if errors.As(err, &rateLimitErr) {
 		return "rate_limit_exceeded"
 	}
+	var upstreamErr *provider.UpstreamError
+	if errors.As(err, &upstreamErr) {
+		return provider.ErrorCode(err)
+	}
 	if errors.Is(err, context.Canceled) {
 		return "request_canceled"
 	}
@@ -469,8 +536,17 @@ func gatewayErrorCode(err error) string {
 	return "provider_request_failed"
 }
 
+func providerNameFromError(err error, fallback string) string {
+	var upstreamErr *provider.UpstreamError
+	if errors.As(err, &upstreamErr) && upstreamErr.Provider != "" {
+		return upstreamErr.Provider
+	}
+	return fallback
+}
+
 type meteredStream struct {
 	inner  provider.Stream
+	cancel context.CancelFunc
 	finish func(status, errorCode string, usage provider.ChatUsage)
 	once   sync.Once
 	usage  provider.ChatUsage
@@ -502,6 +578,9 @@ func (s *meteredStream) Close() error {
 
 func (s *meteredStream) finishOnce(status, errorCode string) {
 	s.once.Do(func() {
+		if s.cancel != nil {
+			s.cancel()
+		}
 		s.finish(status, errorCode, s.usage)
 	})
 }

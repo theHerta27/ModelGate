@@ -14,6 +14,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"github.com/theHerta27/ModelGate/internal/metrics"
 	"github.com/theHerta27/ModelGate/internal/provider"
 	"github.com/theHerta27/ModelGate/internal/ratelimit"
 	"github.com/theHerta27/ModelGate/internal/service"
@@ -57,6 +58,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		)
 		return
 	}
+	metrics.SetModel(c, req.Model)
 	if req.Stream {
 		h.streamChatCompletions(c, &req)
 		return
@@ -80,6 +82,7 @@ func (h *Handler) streamChatCompletions(c *gin.Context, req *provider.ChatReques
 	defer result.Stream.Close()
 	applyRateLimitHeaders(c, result.RateLimit)
 	c.Header("X-Request-ID", result.RequestID)
+	c.Header("X-ModelGate-Provider", result.Provider)
 
 	firstChunk, err := result.Stream.Recv()
 	if err != nil {
@@ -134,6 +137,10 @@ func writeMappedError(c *gin.Context, err error) {
 	var rateLimitErr *service.RateLimitError
 	var idempotencyErr *service.IdempotencyError
 	var dependencyErr *service.DependencyError
+	var upstreamErr *provider.UpstreamError
+	if errors.As(err, &upstreamErr) && upstreamErr.Provider != "" {
+		c.Header("X-ModelGate-Provider", upstreamErr.Provider)
+	}
 	switch {
 	case errors.As(err, &validationErr):
 		writeError(
@@ -175,6 +182,19 @@ func writeMappedError(c *gin.Context, err error) {
 			dependencyErr.Code,
 			"a required gateway dependency is unavailable",
 		)
+	case errors.As(err, &upstreamErr):
+		status := http.StatusBadGateway
+		message := "provider request failed"
+		code := provider.ErrorCode(err)
+		switch code {
+		case "upstream_timeout":
+			status = http.StatusGatewayTimeout
+			message = "provider request timed out"
+		case "no_healthy_provider":
+			status = http.StatusServiceUnavailable
+			message = "no healthy provider is available"
+		}
+		writeError(c, status, "upstream_error", code, message)
 	case errors.Is(err, context.DeadlineExceeded):
 		writeError(
 			c,
@@ -213,12 +233,14 @@ func requestMetadata(c *gin.Context) service.RequestMetadata {
 	return service.RequestMetadata{
 		ClientIdentity: identity,
 		IdempotencyKey: c.GetHeader("Idempotency-Key"),
+		RequestID:      c.Writer.Header().Get("X-Request-ID"),
 	}
 }
 
 func applyResultHeaders(c *gin.Context, result *service.ChatResult) {
 	c.Header("X-Request-ID", result.RequestID)
 	c.Header("X-ModelGate-Cache", result.CacheStatus)
+	c.Header("X-ModelGate-Provider", result.Provider)
 	if result.IdempotencyReplayed {
 		c.Header("Idempotency-Replayed", "true")
 	}

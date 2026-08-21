@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -15,6 +16,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/theHerta27/ModelGate/internal/cache"
+	gatewaymetrics "github.com/theHerta27/ModelGate/internal/metrics"
 	"github.com/theHerta27/ModelGate/internal/provider"
 	"github.com/theHerta27/ModelGate/internal/ratelimit"
 	"github.com/theHerta27/ModelGate/internal/service"
@@ -56,6 +58,23 @@ func TestChatCompletionsWithMockProvider(t *testing.T) {
 	if recorder.Header().Get("X-Request-ID") == "" || recorder.Header().Get("X-ModelGate-Cache") != cache.StatusBypass {
 		t.Fatalf("gateway headers = %#v", recorder.Header())
 	}
+	if recorder.Header().Get("X-ModelGate-Provider") != "test" {
+		t.Fatalf("provider header = %q, want test", recorder.Header().Get("X-ModelGate-Provider"))
+	}
+}
+
+func TestRequestIDMiddlewareReplacesUntrustedClientValue(t *testing.T) {
+	recorder := performJSONRequestWithHeaders(testRouter(provider.NewMockProvider()), []byte(`{
+        "model":"mock-model",
+        "messages":[{"role":"user","content":"hello"}]
+    }`), map[string]string{"X-Request-ID": "client-controlled"})
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if requestID := recorder.Header().Get("X-Request-ID"); requestID == "" || requestID == "client-controlled" {
+		t.Fatalf("server request ID = %q", requestID)
+	}
 }
 
 func TestChatCompletionsRejectsInvalidJSON(t *testing.T) {
@@ -66,6 +85,33 @@ func TestChatCompletionsRejectsInvalidJSON(t *testing.T) {
 	}
 	if !strings.Contains(recorder.Body.String(), `"code":"invalid_json"`) {
 		t.Fatalf("body = %s", recorder.Body.String())
+	}
+	if recorder.Header().Get("X-Request-ID") == "" {
+		t.Fatal("invalid request is missing a server request ID")
+	}
+}
+
+func TestMetricsEndpointIsExposedWhenConfigured(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	telemetry := gatewaymetrics.New()
+	gateway := service.NewGatewayService(
+		service.NewChatService(provider.NewMockProvider()),
+		service.GatewayOptions{ProviderName: "test", CachePolicy: cache.Policy{}},
+	)
+	router := NewRouter(NewHandler(gateway), RouterOptions{
+		Metrics: telemetry,
+		Logger:  slog.New(slog.NewJSONHandler(io.Discard, nil)),
+	})
+	health := httptest.NewRecorder()
+	router.ServeHTTP(health, httptest.NewRequest(http.MethodGet, "/health", nil))
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", response.Code)
+	}
+	if !strings.Contains(response.Body.String(), "modelgate_requests_total") {
+		t.Fatalf("metrics body = %s", response.Body.String())
 	}
 }
 

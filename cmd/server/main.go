@@ -4,22 +4,29 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/theHerta27/ModelGate/internal/api"
 	"github.com/theHerta27/ModelGate/internal/cache"
+	"github.com/theHerta27/ModelGate/internal/circuitbreaker"
+	providerconcurrency "github.com/theHerta27/ModelGate/internal/concurrency"
 	"github.com/theHerta27/ModelGate/internal/config"
+	"github.com/theHerta27/ModelGate/internal/governance"
 	"github.com/theHerta27/ModelGate/internal/idempotency"
+	"github.com/theHerta27/ModelGate/internal/metrics"
 	"github.com/theHerta27/ModelGate/internal/provider"
 	"github.com/theHerta27/ModelGate/internal/ratelimit"
 	"github.com/theHerta27/ModelGate/internal/redisstore"
+	"github.com/theHerta27/ModelGate/internal/retry"
+	"github.com/theHerta27/ModelGate/internal/routing"
 	"github.com/theHerta27/ModelGate/internal/service"
 	"github.com/theHerta27/ModelGate/internal/storage"
 	"github.com/theHerta27/ModelGate/migrations"
@@ -27,7 +34,8 @@ import (
 
 func main() {
 	if err := run(); err != nil {
-		log.Fatal(err)
+		slog.Error("ModelGate stopped", slog.Any("error", err))
+		os.Exit(1)
 	}
 }
 
@@ -36,19 +44,25 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
+	logger := newLogger(cfg.LogLevel)
+	slog.SetDefault(logger)
+	gin.SetMode(gin.ReleaseMode)
+	telemetry := metrics.New()
 
-	chatProvider, err := provider.NewFromConfig(cfg)
+	chatProvider, err := buildProviderRouter(cfg, telemetry)
 	if err != nil {
-		return fmt.Errorf("create provider: %w", err)
+		return err
 	}
 	chatService := service.NewChatService(chatProvider)
 	gatewayOptions := service.GatewayOptions{
-		ProviderName:      cfg.Provider,
+		ProviderName:      "router",
+		RequestTimeout:    cfg.RequestTimeout,
 		OperationTimeout:  cfg.StorageTimeout,
 		RateLimitFailOpen: cfg.RateLimitFailOpen,
 		CachePolicy:       cache.Policy{},
+		Observer:          telemetry,
 		ErrorSink: func(err error) {
-			log.Printf("gateway dependency error: %v", err)
+			logger.Error("gateway dependency error", slog.Any("error", err))
 		},
 	}
 
@@ -125,7 +139,7 @@ func run() error {
 
 	gateway := service.NewGatewayService(chatService, gatewayOptions)
 	handler := api.NewHandler(gateway)
-	router := api.NewRouter(handler)
+	router := api.NewRouter(handler, api.RouterOptions{Metrics: telemetry, Logger: logger})
 
 	server := &http.Server{
 		Addr:              cfg.HTTPAddr,
@@ -143,7 +157,12 @@ func run() error {
 
 	serverErr := make(chan error, 1)
 	go func() {
-		log.Printf("ModelGate listening on %s with provider %s", cfg.HTTPAddr, cfg.Provider)
+		logger.Info(
+			"ModelGate listening",
+			slog.String("address", cfg.HTTPAddr),
+			slog.String("routing_strategy", cfg.RoutingStrategy),
+			slog.Int("provider_count", len(cfg.Providers)),
+		)
 		serverErr <- server.ListenAndServe()
 	}()
 
@@ -163,4 +182,81 @@ func run() error {
 	}
 
 	return nil
+}
+
+func buildProviderRouter(cfg config.Config, telemetry *metrics.Metrics) (provider.Provider, error) {
+	targets := make([]routing.WeightedTarget, 0, len(cfg.Providers))
+	for _, targetConfig := range cfg.Providers {
+		rawProvider, err := provider.NewTargetFromConfig(cfg, targetConfig)
+		if err != nil {
+			return nil, fmt.Errorf("create provider %q: %w", targetConfig.Name, err)
+		}
+		providerName := targetConfig.Name
+		retryPolicy, err := retry.New(retry.Options{
+			MaxAttempts:    cfg.RetryMaxAttempts,
+			AttemptTimeout: cfg.UpstreamAttemptTimeout,
+			BaseBackoff:    cfg.RetryBaseBackoff,
+			MaxBackoff:     cfg.RetryMaxBackoff,
+			OnAttempt: func(attempt retry.Attempt) {
+				telemetry.ObserveUpstreamAttempt(providerName, attempt)
+			},
+		})
+		if err != nil {
+			return nil, fmt.Errorf("create retry policy for %q: %w", providerName, err)
+		}
+		var breaker *circuitbreaker.Breaker
+		breaker, err = circuitbreaker.New(circuitbreaker.Options{
+			WindowSize:          cfg.CircuitBreakerWindowSize,
+			MinimumRequests:     cfg.CircuitBreakerMinimumRequests,
+			FailureRatio:        cfg.CircuitBreakerFailureRatio,
+			OpenTimeout:         cfg.CircuitBreakerOpenTimeout,
+			HalfOpenMaxRequests: cfg.CircuitBreakerHalfOpenMaxRequests,
+			OnStateChange: func(circuitbreaker.State) {
+				// A delayed callback reads the current state, so concurrent transitions
+				// cannot leave the exported gauge at an older value.
+				telemetry.SetCircuitState(providerName, breaker.State())
+			},
+		})
+		if err != nil {
+			return nil, fmt.Errorf("create circuit breaker for %q: %w", providerName, err)
+		}
+		telemetry.SetCircuitState(providerName, circuitbreaker.StateClosed)
+		semaphore, err := providerconcurrency.New(cfg.ProviderMaxConcurrency)
+		if err != nil {
+			return nil, fmt.Errorf("create concurrency limit for %q: %w", providerName, err)
+		}
+		governedProvider, err := governance.NewProvider(
+			providerName,
+			rawProvider,
+			retryPolicy,
+			breaker,
+			semaphore,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("govern provider %q: %w", providerName, err)
+		}
+		targets = append(targets, routing.WeightedTarget{
+			Target: governedProvider,
+			Weight: targetConfig.Weight,
+		})
+	}
+
+	router, err := routing.New(routing.Strategy(cfg.RoutingStrategy), targets)
+	if err != nil {
+		return nil, fmt.Errorf("create provider router: %w", err)
+	}
+	return router, nil
+}
+
+func newLogger(levelName string) *slog.Logger {
+	level := slog.LevelInfo
+	switch levelName {
+	case "debug":
+		level = slog.LevelDebug
+	case "warn":
+		level = slog.LevelWarn
+	case "error":
+		level = slog.LevelError
+	}
+	return slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: level}))
 }

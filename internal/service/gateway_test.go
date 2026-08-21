@@ -96,6 +96,20 @@ type fakeRecorder struct {
 	err     error
 }
 
+type fakeGatewayObserver struct {
+	rateLimited int
+	cacheHits   int
+	provider    string
+	usage       provider.ChatUsage
+}
+
+func (o *fakeGatewayObserver) ObserveRateLimited() { o.rateLimited++ }
+func (o *fakeGatewayObserver) ObserveCacheHit()    { o.cacheHits++ }
+func (o *fakeGatewayObserver) ObserveTokens(providerName string, usage provider.ChatUsage) {
+	o.provider = providerName
+	o.usage = usage
+}
+
 func (r *fakeRecorder) Record(_ context.Context, record storage.RequestRecord) error {
 	r.records = append(r.records, record)
 	return r.err
@@ -123,7 +137,8 @@ func TestGatewayRateLimitDeniedBeforeProvider(t *testing.T) {
 		Allowed: false, Limit: 1, Remaining: 0, RetryAfter: time.Second,
 	}}
 	recorder := &fakeRecorder{}
-	gateway := newTestGateway(upstream, GatewayOptions{Limiter: limiter, Recorder: recorder})
+	observer := &fakeGatewayObserver{}
+	gateway := newTestGateway(upstream, GatewayOptions{Limiter: limiter, Recorder: recorder, Observer: observer})
 
 	_, err := gateway.Chat(context.Background(), gatewayRequest(nil), RequestMetadata{ClientIdentity: "client"})
 	var rateLimitErr *RateLimitError
@@ -132,6 +147,9 @@ func TestGatewayRateLimitDeniedBeforeProvider(t *testing.T) {
 	}
 	if upstream.chatCalls != 0 || len(recorder.records) != 1 || recorder.records[0].Status != storage.StatusRateLimited {
 		t.Fatalf("provider calls/records = %d/%#v", upstream.chatCalls, recorder.records)
+	}
+	if observer.rateLimited != 1 {
+		t.Fatalf("rate limited observations = %d, want 1", observer.rateLimited)
 	}
 }
 
@@ -246,13 +264,17 @@ func TestGatewayCachePolicyHitMissAndBypass(t *testing.T) {
 		responseCache := &fakeCache{payload: payload, found: true}
 		upstream := &gatewayProvider{response: gatewayResponse("unused")}
 		recorder := &fakeRecorder{}
-		gateway := newTestGateway(upstream, GatewayOptions{Cache: responseCache, Recorder: recorder})
+		observer := &fakeGatewayObserver{}
+		gateway := newTestGateway(upstream, GatewayOptions{Cache: responseCache, Recorder: recorder, Observer: observer})
 		result, err := gateway.Chat(context.Background(), gatewayRequest(&zero), RequestMetadata{ClientIdentity: "client"})
 		if err != nil || result.CacheStatus != cache.StatusHit || upstream.chatCalls != 0 {
 			t.Fatalf("result/error/calls = %#v/%v/%d", result, err, upstream.chatCalls)
 		}
 		if recorder.records[0].TotalTokens != 0 || recorder.records[0].Status != storage.StatusCacheHit {
 			t.Fatalf("cache hit usage record = %#v", recorder.records[0])
+		}
+		if observer.cacheHits != 1 {
+			t.Fatalf("cache observations = %d, want 1", observer.cacheHits)
 		}
 	})
 	t.Run("miss", func(t *testing.T) {
@@ -285,6 +307,39 @@ func TestGatewayCachePolicyHitMissAndBypass(t *testing.T) {
 			t.Fatalf("result/error/get = %#v/%v/%d", result, err, responseCache.getCalls)
 		}
 	})
+}
+
+func TestGatewayAppliesOverallRequestTimeout(t *testing.T) {
+	upstream := stubProvider{chat: func(ctx context.Context, _ *provider.ChatRequest) (*provider.ChatResponse, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}}
+	gateway := newTestGateway(upstream, GatewayOptions{RequestTimeout: 10 * time.Millisecond})
+
+	_, err := gateway.Chat(context.Background(), gatewayRequest(nil), RequestMetadata{ClientIdentity: "client"})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Chat() error = %v, want deadline exceeded", err)
+	}
+}
+
+func TestGatewayReportsActualProviderTokens(t *testing.T) {
+	response := gatewayResponse("fresh")
+	response.Provider = "primary"
+	observer := &fakeGatewayObserver{}
+	gateway := newTestGateway(&gatewayProvider{response: response}, GatewayOptions{Observer: observer})
+
+	result, err := gateway.Chat(context.Background(), gatewayRequest(nil), RequestMetadata{
+		ClientIdentity: "client", RequestID: "server-request-id",
+	})
+	if err != nil {
+		t.Fatalf("Chat() error = %v", err)
+	}
+	if result.RequestID != "server-request-id" || result.Provider != "primary" {
+		t.Fatalf("result = %#v", result)
+	}
+	if observer.provider != "primary" || observer.usage.TotalTokens != 5 {
+		t.Fatalf("token observation = %q/%#v", observer.provider, observer.usage)
+	}
 }
 
 func TestGatewayRecorderFailureDoesNotReplaceSuccess(t *testing.T) {
@@ -352,6 +407,28 @@ func TestGatewayStreamCloseRecordsFailureOnce(t *testing.T) {
 	}
 }
 
+func TestGatewayStreamRetainsOverallDeadlineUntilStreamFinishes(t *testing.T) {
+	request := gatewayRequest(nil)
+	request.Stream = true
+	upstream := stubProvider{
+		chat: func(context.Context, *provider.ChatRequest) (*provider.ChatResponse, error) {
+			return nil, errors.New("unexpected chat call")
+		},
+		chatStream: func(ctx context.Context, _ *provider.ChatRequest) (provider.Stream, error) {
+			return &deadlineStream{ctx: ctx}, nil
+		},
+	}
+	gateway := newTestGateway(upstream, GatewayOptions{RequestTimeout: 10 * time.Millisecond})
+
+	result, err := gateway.ChatStream(context.Background(), request, RequestMetadata{ClientIdentity: "client"})
+	if err != nil {
+		t.Fatalf("ChatStream() error = %v", err)
+	}
+	if _, err := result.Stream.Recv(); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Recv() error = %v, want deadline exceeded", err)
+	}
+}
+
 type gatewayStream struct {
 	chunks []*provider.ChatStreamChunk
 	index  int
@@ -367,6 +444,17 @@ func (s *gatewayStream) Recv() (*provider.ChatStreamChunk, error) {
 }
 
 func (*gatewayStream) Close() error { return nil }
+
+type deadlineStream struct {
+	ctx context.Context
+}
+
+func (s *deadlineStream) Recv() (*provider.ChatStreamChunk, error) {
+	<-s.ctx.Done()
+	return nil, s.ctx.Err()
+}
+
+func (*deadlineStream) Close() error { return nil }
 
 func newTestGateway(upstream provider.Provider, options GatewayOptions) *GatewayService {
 	if options.ProviderName == "" {
