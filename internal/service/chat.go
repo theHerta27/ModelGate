@@ -29,7 +29,7 @@ func (s *ChatService) Chat(
 	ctx context.Context,
 	req *provider.ChatRequest,
 ) (*provider.ChatResponse, error) {
-	if err := validateChatRequest(req); err != nil {
+	if err := ValidateChatRequest(req); err != nil {
 		return nil, err
 	}
 	if req.Stream {
@@ -42,7 +42,7 @@ func (s *ChatService) ChatStream(
 	ctx context.Context,
 	req *provider.ChatRequest,
 ) (provider.Stream, error) {
-	if err := validateChatRequest(req); err != nil {
+	if err := ValidateChatRequest(req); err != nil {
 		return nil, err
 	}
 	if !req.Stream {
@@ -51,7 +51,7 @@ func (s *ChatService) ChatStream(
 	return s.provider.ChatStream(ctx, req)
 }
 
-func validateChatRequest(req *provider.ChatRequest) error {
+func ValidateChatRequest(req *provider.ChatRequest) error {
 	if req == nil {
 		return invalid("invalid_request", "request body is required")
 	}
@@ -72,7 +72,7 @@ func validateChatRequest(req *provider.ChatRequest) error {
 		if _, ok := validRoles[message.Role]; !ok {
 			return invalid(
 				"invalid_message_role",
-				fmt.Sprintf("messages[%d].role is not supported in V1", index),
+				fmt.Sprintf("messages[%d].role is not supported", index),
 			)
 		}
 		if strings.TrimSpace(message.Content) == "" {

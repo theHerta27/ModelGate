@@ -10,10 +10,13 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
+	"github.com/theHerta27/ModelGate/internal/cache"
 	"github.com/theHerta27/ModelGate/internal/provider"
+	"github.com/theHerta27/ModelGate/internal/ratelimit"
 	"github.com/theHerta27/ModelGate/internal/service"
 )
 
@@ -49,6 +52,9 @@ func TestChatCompletionsWithMockProvider(t *testing.T) {
 	}
 	if resp.Choices[0].Message.Content != "Mock response: hello" {
 		t.Fatalf("content = %q", resp.Choices[0].Message.Content)
+	}
+	if recorder.Header().Get("X-Request-ID") == "" || recorder.Header().Get("X-ModelGate-Cache") != cache.StatusBypass {
+		t.Fatalf("gateway headers = %#v", recorder.Header())
 	}
 }
 
@@ -184,6 +190,58 @@ func TestChatCompletionsClosesStreamThatEndsBeforeFirstChunk(t *testing.T) {
 	}
 }
 
+func TestChatCompletionsMapsRateLimitError(t *testing.T) {
+	limiter := &apiLimiter{decision: ratelimit.Decision{
+		Allowed: false, Limit: 10, Remaining: 0, RetryAfter: 1500 * time.Millisecond,
+	}}
+	router := testRouterWithOptions(provider.NewMockProvider(), service.GatewayOptions{Limiter: limiter})
+	recorder := performJSONRequest(router, []byte(`{
+        "model":"mock-model",
+        "messages":[{"role":"user","content":"hello"}]
+    }`))
+
+	if recorder.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429", recorder.Code)
+	}
+	if recorder.Header().Get("Retry-After") != "2" || recorder.Header().Get("X-RateLimit-Limit") != "10" {
+		t.Fatalf("rate limit headers = %#v", recorder.Header())
+	}
+	if !strings.Contains(recorder.Body.String(), `"code":"rate_limit_exceeded"`) {
+		t.Fatalf("body = %s", recorder.Body.String())
+	}
+}
+
+func TestChatCompletionsFailsClosedWhenIdempotencyIsUnavailable(t *testing.T) {
+	router := testRouter(provider.NewMockProvider())
+	recorder := performJSONRequestWithHeaders(router, []byte(`{
+        "model":"mock-model",
+        "messages":[{"role":"user","content":"hello"}]
+    }`), map[string]string{"Idempotency-Key": "request-1"})
+
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", recorder.Code)
+	}
+	if !strings.Contains(recorder.Body.String(), `"code":"idempotency_unavailable"`) {
+		t.Fatalf("body = %s", recorder.Body.String())
+	}
+}
+
+func TestChatCompletionsRejectsIdempotencyForStreams(t *testing.T) {
+	router := testRouter(provider.NewMockProvider())
+	recorder := performJSONRequestWithHeaders(router, []byte(`{
+        "model":"mock-model",
+        "messages":[{"role":"user","content":"hello"}],
+        "stream":true
+    }`), map[string]string{"Idempotency-Key": "request-1"})
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", recorder.Code)
+	}
+	if !strings.Contains(recorder.Body.String(), `"code":"idempotency_not_supported_for_stream"`) {
+		t.Fatalf("body = %s", recorder.Body.String())
+	}
+}
+
 type failingProvider struct {
 	err error
 }
@@ -233,12 +291,31 @@ func (s *trackingStream) Close() error {
 }
 
 func testRouter(chatProvider provider.Provider) http.Handler {
+	return testRouterWithOptions(chatProvider, service.GatewayOptions{})
+}
+
+func testRouterWithOptions(
+	chatProvider provider.Provider,
+	options service.GatewayOptions,
+) http.Handler {
 	gin.SetMode(gin.TestMode)
 	chatService := service.NewChatService(chatProvider)
-	return NewRouter(NewHandler(chatService))
+	options.ProviderName = "test"
+	options.RateLimitFailOpen = true
+	options.CachePolicy = cache.Policy{}
+	gateway := service.NewGatewayService(chatService, options)
+	return NewRouter(NewHandler(gateway))
 }
 
 func performJSONRequest(router http.Handler, body []byte) *httptest.ResponseRecorder {
+	return performJSONRequestWithHeaders(router, body, nil)
+}
+
+func performJSONRequestWithHeaders(
+	router http.Handler,
+	body []byte,
+	headers map[string]string,
+) *httptest.ResponseRecorder {
 	recorder := httptest.NewRecorder()
 	req := httptest.NewRequest(
 		http.MethodPost,
@@ -246,6 +323,17 @@ func performJSONRequest(router http.Handler, body []byte) *httptest.ResponseReco
 		bytes.NewReader(body),
 	)
 	req.Header.Set("Content-Type", "application/json")
+	for name, value := range headers {
+		req.Header.Set(name, value)
+	}
 	router.ServeHTTP(recorder, req)
 	return recorder
+}
+
+type apiLimiter struct {
+	decision ratelimit.Decision
+}
+
+func (l *apiLimiter) Allow(context.Context, string) (ratelimit.Decision, error) {
+	return l.decision, nil
 }

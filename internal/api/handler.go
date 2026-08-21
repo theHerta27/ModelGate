@@ -6,18 +6,23 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"strconv"
+	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
 	"github.com/theHerta27/ModelGate/internal/provider"
+	"github.com/theHerta27/ModelGate/internal/ratelimit"
 	"github.com/theHerta27/ModelGate/internal/service"
 )
 
 const maxRequestBodyBytes = 1 << 20
 
 type Handler struct {
-	chatService *service.ChatService
+	gateway *service.GatewayService
 }
 
 type errorEnvelope struct {
@@ -30,8 +35,8 @@ type errorDetail struct {
 	Code    string `json:"code"`
 }
 
-func NewHandler(chatService *service.ChatService) *Handler {
-	return &Handler{chatService: chatService}
+func NewHandler(gateway *service.GatewayService) *Handler {
+	return &Handler{gateway: gateway}
 }
 
 func (h *Handler) Health(c *gin.Context) {
@@ -57,23 +62,26 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		return
 	}
 
-	resp, err := h.chatService.Chat(c.Request.Context(), &req)
+	result, err := h.gateway.Chat(c.Request.Context(), &req, requestMetadata(c))
 	if err == nil {
-		c.JSON(http.StatusOK, resp)
+		applyResultHeaders(c, result)
+		c.JSON(http.StatusOK, result.Response)
 		return
 	}
 	writeMappedError(c, err)
 }
 
 func (h *Handler) streamChatCompletions(c *gin.Context, req *provider.ChatRequest) {
-	stream, err := h.chatService.ChatStream(c.Request.Context(), req)
+	result, err := h.gateway.ChatStream(c.Request.Context(), req, requestMetadata(c))
 	if err != nil {
 		writeMappedError(c, err)
 		return
 	}
-	defer stream.Close()
+	defer result.Stream.Close()
+	applyRateLimitHeaders(c, result.RateLimit)
+	c.Header("X-Request-ID", result.RequestID)
 
-	firstChunk, err := stream.Recv()
+	firstChunk, err := result.Stream.Recv()
 	if err != nil {
 		if errors.Is(err, io.EOF) {
 			err = fmt.Errorf("provider stream ended before the first chunk")
@@ -93,7 +101,7 @@ func (h *Handler) streamChatCompletions(c *gin.Context, req *provider.ChatReques
 	}
 
 	for {
-		chunk, err := stream.Recv()
+		chunk, err := result.Stream.Recv()
 		switch {
 		case err == nil:
 			if err := writeSSEChunk(c, chunk); err != nil {
@@ -123,6 +131,9 @@ func writeSSEChunk(c *gin.Context, chunk *provider.ChatStreamChunk) error {
 
 func writeMappedError(c *gin.Context, err error) {
 	var validationErr *service.ValidationError
+	var rateLimitErr *service.RateLimitError
+	var idempotencyErr *service.IdempotencyError
+	var dependencyErr *service.DependencyError
 	switch {
 	case errors.As(err, &validationErr):
 		writeError(
@@ -131,6 +142,38 @@ func writeMappedError(c *gin.Context, err error) {
 			"invalid_request_error",
 			validationErr.Code,
 			validationErr.Message,
+		)
+	case errors.As(err, &rateLimitErr):
+		applyRateLimitHeaders(c, rateLimitErr.Decision)
+		retryAfter := max(1, int64((rateLimitErr.Decision.RetryAfter+time.Second-1)/time.Second))
+		c.Header("Retry-After", strconv.FormatInt(retryAfter, 10))
+		writeError(
+			c,
+			http.StatusTooManyRequests,
+			"rate_limit_error",
+			"rate_limit_exceeded",
+			"request rate limit exceeded",
+		)
+	case errors.As(err, &idempotencyErr):
+		message := "a request with this Idempotency-Key is already in progress"
+		if idempotencyErr.Code == "idempotency_key_conflict" {
+			message = "Idempotency-Key was already used with a different request"
+		}
+		c.Header("Retry-After", "1")
+		writeError(
+			c,
+			http.StatusConflict,
+			"invalid_request_error",
+			idempotencyErr.Code,
+			message,
+		)
+	case errors.As(err, &dependencyErr):
+		writeError(
+			c,
+			http.StatusServiceUnavailable,
+			"service_unavailable_error",
+			dependencyErr.Code,
+			"a required gateway dependency is unavailable",
 		)
 	case errors.Is(err, context.DeadlineExceeded):
 		writeError(
@@ -157,6 +200,37 @@ func writeMappedError(c *gin.Context, err error) {
 			"provider request failed",
 		)
 	}
+}
+
+func requestMetadata(c *gin.Context) service.RequestMetadata {
+	identity := c.Request.RemoteAddr
+	if host, _, err := net.SplitHostPort(identity); err == nil {
+		identity = host
+	}
+	if strings.TrimSpace(identity) == "" {
+		identity = "unknown"
+	}
+	return service.RequestMetadata{
+		ClientIdentity: identity,
+		IdempotencyKey: c.GetHeader("Idempotency-Key"),
+	}
+}
+
+func applyResultHeaders(c *gin.Context, result *service.ChatResult) {
+	c.Header("X-Request-ID", result.RequestID)
+	c.Header("X-ModelGate-Cache", result.CacheStatus)
+	if result.IdempotencyReplayed {
+		c.Header("Idempotency-Replayed", "true")
+	}
+	applyRateLimitHeaders(c, result.RateLimit)
+}
+
+func applyRateLimitHeaders(c *gin.Context, decision ratelimit.Decision) {
+	if decision.Limit <= 0 {
+		return
+	}
+	c.Header("X-RateLimit-Limit", strconv.Itoa(decision.Limit))
+	c.Header("X-RateLimit-Remaining", strconv.Itoa(max(0, decision.Remaining)))
 }
 
 func writeError(c *gin.Context, status int, errorType, code, message string) {
