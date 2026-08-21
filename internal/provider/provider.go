@@ -19,6 +19,18 @@ type Stream interface {
 	Close() error
 }
 
+type NamedStream interface {
+	Stream
+	ProviderName() string
+}
+
+func StreamProviderName(stream Stream) string {
+	if named, ok := stream.(NamedStream); ok {
+		return named.ProviderName()
+	}
+	return "unknown"
+}
+
 type ChatRequest struct {
 	Model       string        `json:"model"`
 	Messages    []ChatMessage `json:"messages"`
@@ -34,12 +46,13 @@ type ChatMessage struct {
 }
 
 type ChatResponse struct {
-	ID      string       `json:"id"`
-	Object  string       `json:"object"`
-	Created int64        `json:"created"`
-	Model   string       `json:"model"`
-	Choices []ChatChoice `json:"choices"`
-	Usage   ChatUsage    `json:"usage"`
+	Provider string       `json:"-"`
+	ID       string       `json:"id"`
+	Object   string       `json:"object"`
+	Created  int64        `json:"created"`
+	Model    string       `json:"model"`
+	Choices  []ChatChoice `json:"choices"`
+	Usage    ChatUsage    `json:"usage"`
 }
 
 type ChatChoice struct {

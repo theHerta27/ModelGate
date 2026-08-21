@@ -65,19 +65,32 @@ func (p *OpenAICompatibleProvider) Chat(ctx context.Context, req *ChatRequest) (
 
 	responseBody, err := io.ReadAll(io.LimitReader(resp.Body, maxUpstreamResponseBytes+1))
 	if err != nil {
-		return nil, fmt.Errorf("read %s response: %w", p.name, err)
+		return nil, &UpstreamError{
+			Provider: p.name, Operation: "read response", Kind: ErrorKindNetwork,
+			Retryable: retryableTransportError(err), Cause: err,
+		}
 	}
 	if len(responseBody) > maxUpstreamResponseBytes {
-		return nil, fmt.Errorf("%s response exceeds %d bytes", p.name, maxUpstreamResponseBytes)
+		return nil, &UpstreamError{
+			Provider: p.name, Operation: "read response", Kind: ErrorKindInvalidResponse,
+			Cause: fmt.Errorf("response exceeds %d bytes", maxUpstreamResponseBytes),
+		}
 	}
 
 	var chatResponse ChatResponse
 	if err := json.Unmarshal(responseBody, &chatResponse); err != nil {
-		return nil, fmt.Errorf("decode %s response: %w", p.name, err)
+		return nil, &UpstreamError{
+			Provider: p.name, Operation: "decode response", Kind: ErrorKindInvalidResponse,
+			Cause: err,
+		}
 	}
 	if chatResponse.ID == "" || len(chatResponse.Choices) == 0 {
-		return nil, fmt.Errorf("%s provider returned an incomplete response", p.name)
+		return nil, &UpstreamError{
+			Provider: p.name, Operation: "validate response", Kind: ErrorKindInvalidResponse,
+			Cause: fmt.Errorf("provider returned an incomplete response"),
+		}
 	}
+	chatResponse.Provider = p.name
 
 	return &chatResponse, nil
 }
@@ -97,7 +110,10 @@ func (p *OpenAICompatibleProvider) ChatStream(
 	mediaType, _, err := mime.ParseMediaType(resp.Header.Get("Content-Type"))
 	if err != nil || mediaType != "text/event-stream" {
 		_ = resp.Body.Close()
-		return nil, fmt.Errorf("%s provider returned a non-SSE response", p.name)
+		return nil, &UpstreamError{
+			Provider: p.name, Operation: "validate stream response", Kind: ErrorKindInvalidResponse,
+			Cause: fmt.Errorf("provider returned a non-SSE response"),
+		}
 	}
 
 	return newSSEStream(ctx, resp.Body), nil
@@ -123,11 +139,18 @@ func (p *OpenAICompatibleProvider) doRequest(
 
 	resp, err := p.client.Do(httpReq)
 	if err != nil {
-		return nil, fmt.Errorf("call %s provider: %w", p.name, err)
+		return nil, &UpstreamError{
+			Provider: p.name, Operation: "request", Kind: ErrorKindNetwork,
+			Retryable: retryableTransportError(err), Cause: err,
+		}
 	}
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		_ = resp.Body.Close()
-		return nil, fmt.Errorf("%s provider returned HTTP %d", p.name, resp.StatusCode)
+		return nil, &UpstreamError{
+			Provider: p.name, Operation: "request", Kind: ErrorKindHTTPStatus,
+			StatusCode: resp.StatusCode,
+			Retryable:  resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusServiceUnavailable,
+		}
 	}
 	return resp, nil
 }
