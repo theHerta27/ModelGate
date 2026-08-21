@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -62,7 +63,7 @@ func TestChatCompletionsRejectsInvalidJSON(t *testing.T) {
 	}
 }
 
-func TestChatCompletionsRejectsStreaming(t *testing.T) {
+func TestChatCompletionsStreamsSSE(t *testing.T) {
 	body := []byte(`{
         "model":"mock-model",
         "messages":[{"role":"user","content":"hello"}],
@@ -70,11 +71,35 @@ func TestChatCompletionsRejectsStreaming(t *testing.T) {
     }`)
 	recorder := performJSONRequest(testRouter(provider.NewMockProvider()), body)
 
-	if recorder.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400", recorder.Code)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", recorder.Code)
 	}
-	if !strings.Contains(recorder.Body.String(), `"code":"streaming_not_supported"`) {
+	if got := recorder.Header().Get("Content-Type"); !strings.HasPrefix(got, "text/event-stream") {
+		t.Fatalf("Content-Type = %q", got)
+	}
+	if !recorder.Flushed {
+		t.Fatal("stream response was not flushed")
+	}
+	if !strings.Contains(recorder.Body.String(), "data: [DONE]\n\n") {
 		t.Fatalf("body = %s", recorder.Body.String())
+	}
+
+	var content string
+	for _, event := range strings.Split(recorder.Body.String(), "\n\n") {
+		data := strings.TrimPrefix(event, "data: ")
+		if data == event || data == "" || data == "[DONE]" {
+			continue
+		}
+		var chunk provider.ChatStreamChunk
+		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+			t.Fatalf("decode chunk: %v", err)
+		}
+		for _, choice := range chunk.Choices {
+			content += choice.Delta.Content
+		}
+	}
+	if content != "Mock response: hello" {
+		t.Fatalf("stream content = %q", content)
 	}
 }
 
@@ -94,6 +119,71 @@ func TestChatCompletionsHidesProviderError(t *testing.T) {
 	}
 }
 
+func TestChatCompletionsMapsStreamSetupError(t *testing.T) {
+	failing := failingProvider{err: errors.New("secret stream setup detail")}
+	body := []byte(`{
+        "model":"mock-model",
+        "messages":[{"role":"user","content":"hello"}],
+        "stream":true
+    }`)
+	recorder := performJSONRequest(testRouter(failing), body)
+
+	if recorder.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", recorder.Code)
+	}
+	if strings.Contains(recorder.Body.String(), "secret stream setup detail") {
+		t.Fatalf("provider error leaked: %s", recorder.Body.String())
+	}
+}
+
+func TestChatCompletionsClosesStreamAfterMidStreamError(t *testing.T) {
+	stream := &trackingStream{
+		chunks: []*provider.ChatStreamChunk{{
+			ID:      "chunk-1",
+			Object:  "chat.completion.chunk",
+			Created: 1,
+			Model:   "mock-model",
+		}},
+		err: errors.New("mid-stream failure"),
+	}
+	body := []byte(`{
+        "model":"mock-model",
+        "messages":[{"role":"user","content":"hello"}],
+        "stream":true
+    }`)
+	recorder := performJSONRequest(testRouter(streamOnlyProvider{stream: stream}), body)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", recorder.Code)
+	}
+	if strings.Contains(recorder.Body.String(), "[DONE]") {
+		t.Fatalf("failed stream must not emit DONE: %s", recorder.Body.String())
+	}
+	if !stream.closed {
+		t.Fatal("stream was not closed")
+	}
+}
+
+func TestChatCompletionsClosesStreamThatEndsBeforeFirstChunk(t *testing.T) {
+	stream := &trackingStream{}
+	body := []byte(`{
+        "model":"mock-model",
+        "messages":[{"role":"user","content":"hello"}],
+        "stream":true
+    }`)
+	recorder := performJSONRequest(testRouter(streamOnlyProvider{stream: stream}), body)
+
+	if recorder.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", recorder.Code)
+	}
+	if !stream.closed {
+		t.Fatal("empty stream was not closed")
+	}
+	if !strings.Contains(recorder.Body.String(), `"code":"provider_request_failed"`) {
+		t.Fatalf("body = %s", recorder.Body.String())
+	}
+}
+
 type failingProvider struct {
 	err error
 }
@@ -102,8 +192,44 @@ func (p failingProvider) Chat(context.Context, *provider.ChatRequest) (*provider
 	return nil, p.err
 }
 
-func (failingProvider) ChatStream(context.Context, *provider.ChatRequest) (provider.Stream, error) {
-	return nil, provider.ErrStreamingNotSupported
+func (p failingProvider) ChatStream(context.Context, *provider.ChatRequest) (provider.Stream, error) {
+	return nil, p.err
+}
+
+type streamOnlyProvider struct {
+	stream provider.Stream
+}
+
+func (streamOnlyProvider) Chat(context.Context, *provider.ChatRequest) (*provider.ChatResponse, error) {
+	return nil, errors.New("unexpected Chat call")
+}
+
+func (p streamOnlyProvider) ChatStream(context.Context, *provider.ChatRequest) (provider.Stream, error) {
+	return p.stream, nil
+}
+
+type trackingStream struct {
+	chunks []*provider.ChatStreamChunk
+	err    error
+	index  int
+	closed bool
+}
+
+func (s *trackingStream) Recv() (*provider.ChatStreamChunk, error) {
+	if s.index < len(s.chunks) {
+		chunk := s.chunks[s.index]
+		s.index++
+		return chunk, nil
+	}
+	if s.err != nil {
+		return nil, s.err
+	}
+	return nil, io.EOF
+}
+
+func (s *trackingStream) Close() error {
+	s.closed = true
+	return nil
 }
 
 func testRouter(chatProvider provider.Provider) http.Handler {

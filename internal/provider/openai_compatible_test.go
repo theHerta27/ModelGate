@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -111,5 +112,108 @@ func TestOpenAICompatibleProviderValidatesConstructor(t *testing.T) {
 	_, err := NewOpenAICompatibleProvider("test", "not-a-url", "key", http.DefaultClient)
 	if err == nil {
 		t.Fatal("constructor error = nil, want invalid URL error")
+	}
+}
+
+func TestOpenAICompatibleProviderChatStream(t *testing.T) {
+	var received ChatRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Accept"); got != "text/event-stream" {
+			t.Errorf("Accept = %q, want text/event-stream", got)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&received); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+		_, _ = io.WriteString(w, ": keep-alive\n\n")
+		_, _ = io.WriteString(w, "data: {\"id\":\"stream-1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"test-model\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n")
+		_, _ = io.WriteString(w, "data: {\"id\":\"stream-1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"test-model\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"},\"finish_reason\":null}]}\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer server.Close()
+
+	p, err := NewOpenAICompatibleProvider("test", server.URL, "test-key", server.Client())
+	if err != nil {
+		t.Fatalf("NewOpenAICompatibleProvider() error = %v", err)
+	}
+	stream, err := p.ChatStream(context.Background(), &ChatRequest{
+		Model:    "test-model",
+		Messages: []ChatMessage{{Role: "user", Content: "hello"}},
+	})
+	if err != nil {
+		t.Fatalf("ChatStream() error = %v", err)
+	}
+	defer stream.Close()
+
+	first, err := stream.Recv()
+	if err != nil || first.Choices[0].Delta.Role != "assistant" {
+		t.Fatalf("first Recv() = %#v, %v", first, err)
+	}
+	second, err := stream.Recv()
+	if err != nil || second.Choices[0].Delta.Content != "hello" {
+		t.Fatalf("second Recv() = %#v, %v", second, err)
+	}
+	if _, err := stream.Recv(); !errors.Is(err, io.EOF) {
+		t.Fatalf("final Recv() error = %v, want io.EOF", err)
+	}
+	if !received.Stream {
+		t.Fatal("upstream request stream = false, want true")
+	}
+}
+
+func TestOpenAICompatibleProviderChatStreamPropagatesCancellation(t *testing.T) {
+	requestCanceled := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"id\":\"stream-cancel\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"test-model\",\"choices\":[]}\n\n")
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			t.Error("test response writer does not support flushing")
+			return
+		}
+		flusher.Flush()
+		<-r.Context().Done()
+		close(requestCanceled)
+	}))
+	defer server.Close()
+
+	p, err := NewOpenAICompatibleProvider("test", server.URL, "test-key", server.Client())
+	if err != nil {
+		t.Fatalf("NewOpenAICompatibleProvider() error = %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	stream, err := p.ChatStream(ctx, &ChatRequest{Model: "test-model"})
+	if err != nil {
+		t.Fatalf("ChatStream() error = %v", err)
+	}
+	defer stream.Close()
+
+	if _, err := stream.Recv(); err != nil {
+		t.Fatalf("first Recv() error = %v", err)
+	}
+	cancel()
+	if _, err := stream.Recv(); !errors.Is(err, context.Canceled) {
+		t.Fatalf("second Recv() error = %v, want context.Canceled", err)
+	}
+	select {
+	case <-requestCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("upstream request context was not canceled")
+	}
+}
+
+func TestOpenAICompatibleProviderRejectsNonSSEStream(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{}`)
+	}))
+	defer server.Close()
+
+	p, err := NewOpenAICompatibleProvider("test", server.URL, "test-key", server.Client())
+	if err != nil {
+		t.Fatalf("NewOpenAICompatibleProvider() error = %v", err)
+	}
+	if _, err := p.ChatStream(context.Background(), &ChatRequest{}); err == nil {
+		t.Fatal("ChatStream() error = nil, want non-SSE error")
 	}
 }

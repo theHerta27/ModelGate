@@ -3,6 +3,7 @@ package provider
 import (
 	"context"
 	"errors"
+	"io"
 	"strings"
 	"sync"
 	"testing"
@@ -43,10 +44,76 @@ func TestMockProviderHonorsCanceledContext(t *testing.T) {
 	}
 }
 
-func TestMockProviderStreamingIsDeferred(t *testing.T) {
-	_, err := NewMockProvider().ChatStream(context.Background(), &ChatRequest{})
-	if !errors.Is(err, ErrStreamingNotSupported) {
-		t.Fatalf("ChatStream() error = %v, want ErrStreamingNotSupported", err)
+func TestMockProviderChatStream(t *testing.T) {
+	p := NewMockProvider()
+	req := &ChatRequest{
+		Model:    "mock-model",
+		Messages: []ChatMessage{{Role: "user", Content: "hello stream"}},
+		Stream:   true,
+	}
+
+	stream, err := p.ChatStream(context.Background(), req)
+	if err != nil {
+		t.Fatalf("ChatStream() error = %v", err)
+	}
+
+	var content string
+	var role string
+	var finishReason string
+	ids := make(map[string]struct{})
+	for {
+		chunk, err := stream.Recv()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("Recv() error = %v", err)
+		}
+		ids[chunk.ID] = struct{}{}
+		for _, choice := range chunk.Choices {
+			if choice.Delta.Role != "" {
+				role = choice.Delta.Role
+			}
+			content += choice.Delta.Content
+			if choice.FinishReason != nil {
+				finishReason = *choice.FinishReason
+			}
+		}
+	}
+
+	if role != "assistant" {
+		t.Fatalf("stream role = %q", role)
+	}
+	if content != "Mock response: hello stream" {
+		t.Fatalf("stream content = %q", content)
+	}
+	if finishReason != "stop" {
+		t.Fatalf("finish reason = %q", finishReason)
+	}
+	if len(ids) != 1 {
+		t.Fatalf("stream IDs = %d, want 1", len(ids))
+	}
+	if err := stream.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if _, err := stream.Recv(); !errors.Is(err, io.EOF) {
+		t.Fatalf("Recv() after Close error = %v, want io.EOF", err)
+	}
+	if err := stream.Close(); err != nil {
+		t.Fatalf("second Close() error = %v", err)
+	}
+}
+
+func TestMockProviderStreamHonorsCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	stream, err := NewMockProvider().ChatStream(ctx, &ChatRequest{Model: "mock-model"})
+	if err != nil {
+		t.Fatalf("ChatStream() error = %v", err)
+	}
+	cancel()
+
+	if _, err := stream.Recv(); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Recv() error = %v, want context.Canceled", err)
 	}
 }
 

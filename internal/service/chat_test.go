@@ -9,7 +9,8 @@ import (
 )
 
 type stubProvider struct {
-	chat func(context.Context, *provider.ChatRequest) (*provider.ChatResponse, error)
+	chat       func(context.Context, *provider.ChatRequest) (*provider.ChatResponse, error)
+	chatStream func(context.Context, *provider.ChatRequest) (provider.Stream, error)
 }
 
 func (p stubProvider) Chat(
@@ -19,8 +20,14 @@ func (p stubProvider) Chat(
 	return p.chat(ctx, req)
 }
 
-func (stubProvider) ChatStream(context.Context, *provider.ChatRequest) (provider.Stream, error) {
-	return nil, provider.ErrStreamingNotSupported
+func (p stubProvider) ChatStream(
+	ctx context.Context,
+	req *provider.ChatRequest,
+) (provider.Stream, error) {
+	if p.chatStream == nil {
+		return nil, errors.New("unexpected ChatStream call")
+	}
+	return p.chatStream(ctx, req)
 }
 
 func TestChatServiceCallsProviderWithContext(t *testing.T) {
@@ -47,7 +54,7 @@ func TestChatServiceCallsProviderWithContext(t *testing.T) {
 	}
 }
 
-func TestChatServiceRejectsStreamingBeforeProvider(t *testing.T) {
+func TestChatServiceRejectsStreamingInNonStreamingMethod(t *testing.T) {
 	called := false
 	fake := stubProvider{chat: func(context.Context, *provider.ChatRequest) (*provider.ChatResponse, error) {
 		called = true
@@ -59,11 +66,45 @@ func TestChatServiceRejectsStreamingBeforeProvider(t *testing.T) {
 
 	_, err := service.Chat(context.Background(), req)
 	var validationErr *ValidationError
-	if !errors.As(err, &validationErr) || validationErr.Code != "streaming_not_supported" {
+	if !errors.As(err, &validationErr) || validationErr.Code != "invalid_stream_mode" {
 		t.Fatalf("Chat() error = %v, want streaming validation error", err)
 	}
 	if called {
 		t.Fatal("provider was called for an invalid streaming request")
+	}
+}
+
+func TestChatServiceCallsStreamingProviderWithContext(t *testing.T) {
+	type contextKey string
+	const key contextKey = "request-id"
+
+	expectedStream := &stubStream{}
+	fake := stubProvider{
+		chat: func(context.Context, *provider.ChatRequest) (*provider.ChatResponse, error) {
+			t.Fatal("non-streaming provider method was called")
+			return nil, nil
+		},
+		chatStream: func(ctx context.Context, req *provider.ChatRequest) (provider.Stream, error) {
+			if got := ctx.Value(key); got != "stream-1" {
+				t.Fatalf("context value = %v", got)
+			}
+			if !req.Stream {
+				t.Fatal("stream request flag = false")
+			}
+			return expectedStream, nil
+		},
+	}
+	service := NewChatService(fake)
+	req := validRequest()
+	req.Stream = true
+	ctx := context.WithValue(context.Background(), key, "stream-1")
+
+	stream, err := service.ChatStream(ctx, req)
+	if err != nil {
+		t.Fatalf("ChatStream() error = %v", err)
+	}
+	if stream != expectedStream {
+		t.Fatalf("stream = %T, want expected stub", stream)
 	}
 }
 
@@ -99,4 +140,14 @@ func validRequest() *provider.ChatRequest {
 		Model:    "mock-model",
 		Messages: []provider.ChatMessage{{Role: "user", Content: "hello"}},
 	}
+}
+
+type stubStream struct{}
+
+func (*stubStream) Recv() (*provider.ChatStreamChunk, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (*stubStream) Close() error {
+	return nil
 }
