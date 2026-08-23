@@ -1,14 +1,18 @@
 # ModelGate
 
+[![CI](https://github.com/theHerta27/ModelGate/actions/workflows/ci.yml/badge.svg)](https://github.com/theHerta27/ModelGate/actions/workflows/ci.yml)
+
 > A learning-driven LLM and Agent Gateway written in Go.
+
+## Overview
 
 ModelGate is a portfolio backend project that builds the infrastructure behind LLM applications one capability at a time. Each version stays runnable, testable, and deliberately small enough to explain in an interview.
 
 ## Current Status
 
-**Version 3 — provider governance, deterministic routing, and observability complete**
+**Version 4 — reproducible environment, real-dependency integration tests, benchmarks, and CI complete**
 
-V3 adds production-style timeout, retry, circuit-breaker, concurrency, routing, metrics, and structured-logging policies. The deterministic Mock Provider and all external infrastructure remain disabled by default, so the gateway still starts without credentials, Redis, PostgreSQL, Prometheus, or Grafana.
+V4 packages the V1-V3 gateway into a reproducible Docker Compose environment and adds independent CI evidence for unit tests, the race detector, real Redis/PostgreSQL behavior, Docker build, and a five-service smoke test. The deterministic Mock Provider remains the default, and no real LLM key is required by local startup or CI.
 
 ## Features
 
@@ -24,9 +28,11 @@ V3 adds production-style timeout, retry, circuit-breaker, concurrency, routing, 
 - PostgreSQL migrations and transactional request/usage persistence with pgx
 - OpenAI-style errors, bounded timeouts, and graceful server shutdown
 - Prometheus metrics at `GET /metrics`, JSON logs through `slog`, and an importable Grafana dashboard
-- Unit and HTTP tests that require no real LLM credentials
+- Multi-stage, non-root Docker image and a Compose stack for ModelGate, PostgreSQL, Redis, Prometheus, and Grafana
+- Real-service integration tests, serial/parallel microbenchmarks, and GitHub Actions quality gates
+- Unit, HTTP, integration, and CI tests that require no real LLM credentials
 
-Not implemented yet: API-key authentication, distributed tracing, runtime service containers, real-service integration tests, benchmarks, or CI.
+Intentionally outside V4: API-key authentication, distributed tracing, dynamic provider discovery, Kubernetes deployment, and optional message-queue decoupling.
 
 ## Architecture
 
@@ -48,7 +54,7 @@ Client
        `-- Usage Recorder    pgx transaction + explicit SQL
 ```
 
-Redis and PostgreSQL are optional adapters. Setting either `*_ENABLED=true` makes ModelGate verify that dependency at startup; PostgreSQL migrations then run automatically.
+Redis and PostgreSQL are optional adapters in direct Go startup. The Compose profile enables both, waits for their health checks, then starts ModelGate. Prometheus scrapes ModelGate over the private bridge network and Grafana reads the provisioned Prometheus datasource.
 
 ## Technology Stack
 
@@ -56,13 +62,14 @@ Redis and PostgreSQL are optional adapters. Setting either `*_ENABLED=true` make
 - Redis with go-redis and Lua scripts
 - PostgreSQL with pgxpool and embedded SQL migrations
 - Prometheus Go client, standard-library `slog` JSON logging, and a Grafana dashboard JSON
-- Mock Provider and `httptest` for deterministic tests
-
-Docker Compose, running Prometheus/Grafana services, real-service integration tests, benchmarks, and CI remain V4 work.
+- Docker Compose, Prometheus 3.12, Grafana 13.1, PostgreSQL 18.6, and Redis 8.10
+- Mock Provider, `httptest`, real service containers, and GitHub Actions
 
 ## Quick Start
 
-Requirements: Go 1.26.4 or later.
+### Minimal gateway
+
+Requirement: Go 1.26.4 or later.
 
 ```bash
 go run ./cmd/server
@@ -90,6 +97,32 @@ curl -N http://localhost:8080/v1/chat/completions \
 ```
 
 Copy `.env.example` to `.env` as a reference, then export the values through your shell or runtime. ModelGate does not load `.env` files automatically.
+
+### Complete stack
+
+Requirement: Docker Engine or Docker Desktop with the Compose plugin.
+
+```bash
+docker compose up -d --build
+docker compose ps
+```
+
+The one command starts:
+
+- ModelGate: http://127.0.0.1:8080
+- Prometheus: http://127.0.0.1:9090
+- Grafana: http://127.0.0.1:3000
+- PostgreSQL: `127.0.0.1:5432`
+- Redis: `127.0.0.1:6379`
+
+Compose uses clearly marked `modelgate_local_only` fallback passwords so a fresh clone can start without a secret file. They are local-development credentials, bind only to loopback host ports, and must be replaced for any shared environment.
+
+```bash
+docker compose logs -f modelgate
+docker compose down
+```
+
+Named volumes preserve database, Redis, Prometheus, and Grafana data across a normal `down`. Use `docker compose down --volumes` only when you explicitly want to delete that local stack data.
 
 ## Configuration
 
@@ -152,7 +185,27 @@ Copy `.env.example` to `.env` as a reference, then export the values through you
 | `POSTGRES_MAX_CONNS` | `10` | Pool limit, capped at 100 |
 | `STORAGE_TIMEOUT` | `2s` | Individual persistence-operation timeout |
 
-## V2 Policies
+## API
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/health` | Liveness response: `{"status":"ok"}` |
+| `GET` | `/metrics` | Prometheus exposition endpoint |
+| `POST` | `/v1/chat/completions` | OpenAI-style non-streaming JSON or SSE chat completion |
+
+Chat requests support `model`, `messages`, `temperature`, `top_p`, `max_tokens`, and `stream`. Non-streaming requests may send an `Idempotency-Key`. Streaming responses use `text/event-stream`, emit incremental JSON chunks, and terminate with `data: [DONE]`.
+
+Useful response headers include `X-Request-ID`, `X-ModelGate-Provider`, `X-ModelGate-Cache`, `Idempotency-Replayed`, `X-RateLimit-Limit`, `X-RateLimit-Remaining`, and `Retry-After`. Errors use an OpenAI-style `error.message/type/code` envelope.
+
+## Design Decisions
+
+- One deployable process owns HTTP, policy orchestration, and provider selection; package boundaries keep infrastructure replaceable without premature microservices.
+- Providers implement one small interface. CI and Compose use the deterministic Mock Provider, so no DeepSeek/OpenAI secret is needed.
+- Redis and PostgreSQL are optional in direct startup but mandatory in the full Compose profile, making dependency ownership explicit.
+- ModelGate does not fail over after a real upstream call has failed because the provider may already have charged tokens; reselection is limited to breaker availability races.
+- Prompts, API keys, raw client IPs, and request IDs are excluded from metric labels and persistence payloads.
+
+### V2 data policies
 
 | Concern | Policy | Failure behavior |
 |---|---|---|
@@ -163,9 +216,9 @@ Copy `.env.example` to `.env` as a reference, then export the values through you
 
 ModelGate never writes the full prompt to PostgreSQL. Cache and idempotency Redis keys contain SHA-256 digests instead of the prompt or raw client IP.
 
-Useful response headers include `X-Request-ID`, `X-ModelGate-Cache`, `Idempotency-Replayed`, `X-RateLimit-Limit`, `X-RateLimit-Remaining`, and `Retry-After`. Idempotency conflicts/in-progress requests return `409`; an unavailable required idempotency backend returns `503`; rate-limit rejection returns `429`.
+Idempotency conflicts/in-progress requests return `409`; an unavailable required idempotency backend returns `503`; rate-limit rejection returns `429`.
 
-## V3 Governance and Observability
+## Reliability
 
 - A retry is allowed only for HTTP `429`, HTTP `503`, deadlines, and explicitly classified transport failures. Client errors such as `400`, `401`, and `403`, malformed responses, and cancellations are not retried.
 - Backoff uses exponential ceilings plus full jitter, and waiting stops immediately when the parent context is canceled.
@@ -174,14 +227,16 @@ Useful response headers include `X-Request-ID`, `X-ModelGate-Cache`, `Idempotenc
 - Routing is deterministic. Round Robin distributes evenly; smooth Weighted Round Robin follows static weights. ModelGate does not call a second provider after a real upstream failure because that could duplicate token spend; it only reselects when an apparently healthy breaker loses an `Allow` race.
 - Every request gets a server-generated `X-Request-ID`; incoming client values are replaced. Logs include bounded fields such as request ID, route, provider, model, status, and latency, but never prompts, API keys, or client IP labels.
 
-Prometheus scrapes `GET /metrics`. V3 exports:
+## Observability
+
+Prometheus scrapes `GET /metrics`. ModelGate exports:
 
 - `modelgate_requests_total` and `modelgate_request_duration_seconds`
 - `modelgate_tokens_total` and `modelgate_provider_errors_total`
 - `modelgate_rate_limited_total` and `modelgate_cache_hits_total`
 - `modelgate_upstream_requests_total` and `modelgate_circuit_breaker_state`
 
-Labels are deliberately low-cardinality; request IDs and client identities are excluded. Import [`deploy/grafana/modelgate-dashboard.json`](deploy/grafana/modelgate-dashboard.json) into Grafana and select the Prometheus data source. The dashboard definition is shipped in V3, while provisioning Prometheus/Grafana services remains V4.
+Labels are deliberately low-cardinality; request IDs and client identities are excluded. Compose automatically provisions the Prometheus datasource with UID `prometheus` and loads the [ModelGate dashboard](deploy/grafana/modelgate-dashboard.json) into the `ModelGate` folder. The CI Compose smoke waits until Prometheus reports the gateway target up and Grafana returns the provisioned dashboard by UID.
 
 ## PostgreSQL Schema
 
@@ -197,14 +252,38 @@ Embedded migrations create:
 ## Testing
 
 ```bash
+# Deterministic local quality gates
 go test ./...
 go vet ./...
 go build ./cmd/server
+go test -race ./...
+
+# Real Redis, PostgreSQL, migrations, Lua policies, and Gateway HTTP composition
+docker compose --profile test run --rm --build integration
 ```
 
-Tests use fakes, the Mock Provider, or local `httptest` upstreams. They cover policy decisions, timeout ownership, retry classification/backoff cancellation, breaker transitions, semaphore release, weighted routing, metrics/log fields, Lua result handling, migration/transaction boundaries, request headers/status codes, SSE cleanup, cancellation, and provider body cleanup. Real Redis/PostgreSQL and running Prometheus/Grafana integration suites are deferred to the Docker Compose milestone.
+Unit tests use fakes, the Mock Provider, and local `httptest` upstreams. Build-tagged integration tests use real Redis and PostgreSQL, execute the actual Lua scripts and embedded migrations, verify transactional usage records, then exercise idempotency replay and cache hit behavior through the HTTP router. They create unique short-lived keys and delete only their own PostgreSQL request rows.
 
-The race detector can additionally be run with `go test -race ./...` when CGO and a supported C compiler are available.
+GitHub Actions has three independent jobs:
+
+- quality: formatting, `go vet`, unit tests, race detector, and server build
+- integration: Redis/PostgreSQL service containers plus `-tags=integration`
+- container: Compose validation, image build, five-service startup, Gateway request, Prometheus target, and Grafana provisioning smoke
+
+All jobs use the Mock Provider and ephemeral CI database credentials. No LLM token is stored or requested.
+
+## Benchmark
+
+V4 includes serial and `RunParallel` microbenchmarks for the Router, provider concurrency limiter, and Gateway + Mock Provider path. On the documented 16-worker workstation, five-run medians were:
+
+| Case | 1 worker | 16 workers | Allocations |
+|---|---:|---:|---:|
+| Router / Round Robin | 64.09 ns/op | 133.6 ns/op | 1 alloc/op |
+| Router / Weighted Round Robin | 83.69 ns/op | 135.3 ns/op | 1 alloc/op |
+| Provider concurrency limiter | 76.98 ns/op | 115.2 ns/op | 1 alloc/op |
+| Gateway + Mock Provider | 1,747 ns/op | 617.0 ns/op | 12 allocs/op |
+
+See the [complete V4 benchmark methodology and environment](docs/benchmarks/v4.md). These are in-process microbenchmarks without network or model latency; they are regression baselines, not production QPS claims.
 
 ## Roadmap
 
@@ -213,7 +292,7 @@ The race detector can additionally be run with `go test -race ./...` when CGO an
 - [x] **V1.5:** SSE streaming, cancellation, and resource cleanup
 - [x] **V2:** Redis rate limiting, idempotency, response-cache policy, and PostgreSQL usage persistence
 - [x] **V3:** Timeouts, retries, circuit breaker, provider routing, concurrency control, and observability
-- [ ] **V4:** Docker Compose environment, real integration tests, benchmarks, and CI
+- [x] **V4:** Docker Compose environment, real integration tests, benchmarks, and CI
 - [ ] **V5 (optional):** Asynchronous usage events with a message queue when justified by measured requirements
 
 ## Development Principles
