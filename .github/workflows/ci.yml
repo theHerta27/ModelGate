@@ -121,6 +121,22 @@ jobs:
             fi
             sleep 2
           done
+      - name: Capture real Grafana dashboard
+        shell: bash
+        run: |
+          for request in {1..20}; do
+            curl --fail --silent --output /dev/null -H 'Content-Type: application/json' -d '{"model":"mock-model","messages":[{"role":"user","content":"Dashboard sample"}]}' http://127.0.0.1:8080/v1/chat/completions
+          done
+          sleep 10
+          mkdir -p artifacts
+          google-chrome --headless --no-sandbox --disable-gpu --hide-scrollbars --window-size=1600,1200 --virtual-time-budget=10000 --screenshot=artifacts/modelgate-dashboard.png 'http://127.0.0.1:3000/d/modelgate-overview/modelgate-overview?orgId=1&from=now-15m&to=now&kiosk'
+          test -s artifacts/modelgate-dashboard.png
+      - name: Upload real Grafana dashboard
+        uses: actions/upload-artifact@v7
+        with:
+          name: modelgate-dashboard
+          path: artifacts/modelgate-dashboard.png
+          retention-days: 7
       - name: Show service logs after failure
         if: failure()
         run: docker compose logs --no-color
