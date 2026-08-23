@@ -115,7 +115,7 @@ The one command starts:
 - PostgreSQL: `127.0.0.1:5432`
 - Redis: `127.0.0.1:6379`
 
-Compose uses clearly marked `modelgate_local_only` fallback passwords so a fresh clone can start without a secret file. They are local-development credentials, bind only to loopback host ports, and must be replaced for any shared environment.
+Compose uses clearly marked `modelgate_local_only` fallback passwords so a fresh clone can start without a secret file. They are local-development credentials, bind only to loopback host ports, and must be replaced for any shared environment. Grafana permits anonymous Viewer access only on that loopback-bound development port; administrative changes still require the configured account.
 
 ```bash
 docker compose logs -f modelgate
@@ -237,6 +237,10 @@ Prometheus scrapes `GET /metrics`. ModelGate exports:
 - `modelgate_upstream_requests_total` and `modelgate_circuit_breaker_state`
 
 Labels are deliberately low-cardinality; request IDs and client identities are excluded. Compose automatically provisions the Prometheus datasource with UID `prometheus` and loads the [ModelGate dashboard](deploy/grafana/modelgate-dashboard.json) into the `ModelGate` folder. The CI Compose smoke waits until Prometheus reports the gateway target up and Grafana returns the provisioned dashboard by UID.
+
+The screenshot below is captured by GitHub Actions from the real five-service Compose stack after sending Mock Provider traffic; it is not a design mockup.
+
+![ModelGate Grafana dashboard](docs/images/modelgate-dashboard.png)
 
 ## PostgreSQL Schema
 
