@@ -1,0 +1,148 @@
+name: modelgate
+
+services:
+  postgres:
+    image: postgres:18.6-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-modelgate}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-modelgate_local_only}
+      POSTGRES_DB: ${POSTGRES_DB:-modelgate}
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U ${POSTGRES_USER:-modelgate} -d ${POSTGRES_DB:-modelgate}
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    networks:
+      - modelgate
+
+  redis:
+    image: redis:8.10.0-alpine
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --requirepass
+      - ${REDIS_PASSWORD:-modelgate_local_only}
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-modelgate_local_only}
+    ports:
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - redis-cli --no-auth-warning -a "$$REDIS_PASSWORD" ping | grep PONG
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    networks:
+      - modelgate
+
+  modelgate:
+    image: modelgate:local
+    build:
+      context: .
+      target: runtime
+    environment:
+      HTTP_ADDR: :8080
+      MODEL_PROVIDER: mock
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      REDIS_ENABLED: "true"
+      REDIS_ADDR: redis:6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-modelgate_local_only}
+      REDIS_DB: "0"
+      POSTGRES_ENABLED: "true"
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: ${POSTGRES_USER:-modelgate}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-modelgate_local_only}
+      POSTGRES_DB: ${POSTGRES_DB:-modelgate}
+      POSTGRES_SSLMODE: disable
+    ports:
+      - "127.0.0.1:${MODELGATE_PORT:-8080}:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - modelgate
+
+  prometheus:
+    image: prom/prometheus:v3.12.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --web.enable-lifecycle
+    ports:
+      - "127.0.0.1:${PROMETHEUS_PORT:-9090}:9090"
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    depends_on:
+      modelgate:
+        condition: service_healthy
+    networks:
+      - modelgate
+
+  grafana:
+    image: grafana/grafana:13.1.3
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-modelgate_local_only}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    ports:
+      - "127.0.0.1:${GRAFANA_PORT:-3000}:3000"
+    volumes:
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/grafana/modelgate-dashboard.json:/var/lib/grafana/dashboards/modelgate-dashboard.json:ro
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      prometheus:
+        condition: service_started
+    networks:
+      - modelgate
+
+  integration:
+    build:
+      context: .
+      target: test
+    profiles:
+      - test
+    environment:
+      MODELGATE_INTEGRATION: "1"
+      MODELGATE_INTEGRATION_REDIS_ADDR: redis:6379
+      MODELGATE_INTEGRATION_REDIS_PASSWORD: ${REDIS_PASSWORD:-modelgate_local_only}
+      MODELGATE_INTEGRATION_REDIS_DB: "15"
+      MODELGATE_INTEGRATION_POSTGRES_DSN: postgres://${POSTGRES_USER:-modelgate}:${POSTGRES_PASSWORD:-modelgate_local_only}@postgres:5432/${POSTGRES_DB:-modelgate}?sslmode=disable
+    command:
+      - go
+      - test
+      - -tags=integration
+      - ./tests/integration
+      - -count=1
+      - -v
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - modelgate
+
+volumes:
+  postgres_data:
+  redis_data:
+  prometheus_data:
+  grafana_data:
+
+networks:
+  modelgate:
+    driver: bridge

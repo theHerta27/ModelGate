@@ -1,24 +1,14 @@
 {
-  "__inputs": [
-    {
-      "name": "DS_PROMETHEUS",
-      "label": "Prometheus",
-      "description": "Prometheus data source containing ModelGate metrics",
-      "type": "datasource",
-      "pluginId": "prometheus",
-      "pluginName": "Prometheus"
-    }
-  ],
   "annotations": {
     "list": []
   },
-  "description": "ModelGate V3 gateway traffic, latency, provider governance, and token usage.",
+  "description": "ModelGate gateway traffic, latency, provider governance, and token usage.",
   "editable": true,
   "graphTooltip": 1,
   "links": [],
   "panels": [
     {
-      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
       "fieldConfig": {"defaults": {"unit": "reqps"}, "overrides": []},
       "gridPos": {"h": 7, "w": 6, "x": 0, "y": 0},
       "id": 1,
@@ -28,7 +18,7 @@
       "type": "stat"
     },
     {
-      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
       "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []},
       "gridPos": {"h": 7, "w": 6, "x": 6, "y": 0},
       "id": 2,
@@ -38,7 +28,7 @@
       "type": "stat"
     },
     {
-      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
       "fieldConfig": {"defaults": {"max": 1, "min": 0, "unit": "percentunit"}, "overrides": []},
       "gridPos": {"h": 7, "w": 6, "x": 12, "y": 0},
       "id": 3,
@@ -48,7 +38,7 @@
       "type": "stat"
     },
     {
-      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
       "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
       "gridPos": {"h": 7, "w": 6, "x": 18, "y": 0},
       "id": 4,
@@ -61,7 +51,7 @@
       "type": "stat"
     },
     {
-      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
       "fieldConfig": {"defaults": {"unit": "reqps"}, "overrides": []},
       "gridPos": {"h": 8, "w": 12, "x": 0, "y": 7},
       "id": 5,
@@ -71,7 +61,7 @@
       "type": "timeseries"
     },
     {
-      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
       "fieldConfig": {"defaults": {"unit": "reqps"}, "overrides": []},
       "gridPos": {"h": 8, "w": 12, "x": 12, "y": 7},
       "id": 6,
@@ -81,7 +71,7 @@
       "type": "timeseries"
     },
     {
-      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
       "fieldConfig": {"defaults": {"unit": "reqps"}, "overrides": []},
       "gridPos": {"h": 8, "w": 8, "x": 0, "y": 15},
       "id": 7,
@@ -91,7 +81,7 @@
       "type": "timeseries"
     },
     {
-      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
       "fieldConfig": {"defaults": {"decimals": 0, "mappings": [{"options": {"0": {"text": "CLOSED"}, "1": {"text": "OPEN"}, "2": {"text": "HALF_OPEN"}}, "type": "value"}], "max": 2, "min": 0}, "overrides": []},
       "gridPos": {"h": 8, "w": 8, "x": 8, "y": 15},
       "id": 8,
@@ -101,7 +91,7 @@
       "type": "timeseries"
     },
     {
-      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
       "fieldConfig": {"defaults": {"unit": "ops"}, "overrides": []},
       "gridPos": {"h": 8, "w": 8, "x": 16, "y": 15},
       "id": 9,
@@ -120,5 +110,5 @@
   "timezone": "browser",
   "title": "ModelGate Overview",
   "uid": "modelgate-overview",
-  "version": 1
+  "version": 2
 }
